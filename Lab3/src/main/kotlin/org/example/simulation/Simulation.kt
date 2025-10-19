@@ -3,15 +3,26 @@ package org.example.simulation
 import org.example.workload.TraceEvent
 import org.example.workload.WorkloadTrace
 
+private const val MAX_PAGE_FAULT_SAMPLES = 25
+
+/**
+ * Describes the physical memory layout that the paging kernel should emulate.
+ */
 data class SimulationConfig(
     val physicalPageCount: Int,
 )
 
+/**
+ * Page replacement algorithms supported by the laboratory work.
+ */
 enum class AlgorithmType(val displayName: String) {
     RANDOM("Random"),
     CLOCK("Clock"),
 }
 
+/**
+ * Summary of a single simulation run. The [render] function mirrors the original textual report.
+ */
 data class SimulationSummary(
     val algorithm: AlgorithmType,
     val physicalPages: Int,
@@ -27,35 +38,41 @@ data class SimulationSummary(
     val perProcess: List<ProcessStats>,
     val samplePageFaults: List<PageFaultRecord>,
 ) {
-    fun render(): String {
-        val builder = StringBuilder()
-        builder.appendLine("Algorithm: ${algorithm.displayName}")
-        builder.appendLine("Physical frames: $physicalPages")
-        builder.appendLine(
-            "Accesses: $totalAccesses | Page faults: $pageFaults | Fault rate: ${"%.2f".format(pageFaultRate * 100)}%",
+    /**
+     * Produces the legacy textual report detailing the simulation results.
+     */
+    fun render(): String = buildString {
+        appendLine("Algorithm: ${algorithm.displayName}")
+        appendLine("Physical frames: $physicalPages")
+        appendLine(
+            "Accesses: $totalAccesses | Page faults: $pageFaults | Fault rate: ${
+                "%.2f".format(pageFaultRate * 100)
+            }%",
         )
-        builder.appendLine(
+        appendLine(
             "Faults to free frames: $freeFrameFaults | Replacements: $replacements | Disk writes: $diskWrites | Evictions (clean/dirty): $cleanEvictions/$dirtyEvictions",
         )
-        builder.appendLine("Working set changes observed: $workingSetChanges")
-        builder.appendLine("Per-process statistics:")
-        perProcess.forEach {
-            builder.appendLine(
-                "  PID ${it.pid}: accesses=${it.accesses}, faults=${it.pageFaults}, writes=${it.writeCount}, dirtyWrites=${it.dirtyEvictions}",
+        appendLine("Working set changes observed: $workingSetChanges")
+        appendLine("Per-process statistics:")
+        perProcess.forEach { stats ->
+            appendLine(
+                "  PID ${stats.pid}: accesses=${stats.accesses}, faults=${stats.pageFaults}, writes=${stats.writeCount}, dirtyWrites=${stats.dirtyEvictions}",
             )
         }
         if (samplePageFaults.isNotEmpty()) {
-            builder.appendLine("Sample page fault decisions:")
-            samplePageFaults.forEach { rec ->
-                builder.appendLine(
-                    "  [${rec.step}] PID=${rec.pid}, page=${rec.pageIndex}, victim=${rec.victim?.describe() ?: "free frame"}, dirtyWrite=${rec.victim?.wasDirty}",
+            appendLine("Sample page fault decisions:")
+            samplePageFaults.forEach { record ->
+                appendLine(
+                    "  [${record.step}] PID=${record.pid}, page=${record.pageIndex}, victim=${record.victim?.describe() ?: "free frame"}, dirtyWrite=${record.victim?.wasDirty}",
                 )
             }
         }
-        return builder.toString()
     }
 }
 
+/**
+ * Per-process counters that are aggregated across the simulation.
+ */
 data class ProcessStats(
     val pid: Int,
     var accesses: Int = 0,
@@ -64,6 +81,9 @@ data class ProcessStats(
     var dirtyEvictions: Int = 0,
 )
 
+/**
+ * Captures details about a specific page fault for reporting purposes.
+ */
 data class PageFaultRecord(
     val step: Int,
     val pid: Int,
@@ -71,6 +91,9 @@ data class PageFaultRecord(
     val victim: VictimInfo?,
 )
 
+/**
+ * Describes the victim page that was evicted during a page fault.
+ */
 data class VictimInfo(
     val pid: Int,
     val pageIndex: Int,
@@ -79,25 +102,316 @@ data class VictimInfo(
     fun describe(): String = "pid=$pid,page=$pageIndex"
 }
 
-data class PageTableEntry(
-    var present: Boolean = false,
-    var reference: Boolean = false,
-    var dirty: Boolean = false,
-    var frame: PhysicalFrame? = null,
-    var ownerStats: ProcessStats? = null,
-)
-
-data class PhysicalFrame(
-    val index: Int,
-    var ownerPid: Int? = null,
-    var virtualPage: Int? = null,
-    var reference: Boolean = false,
-    var dirty: Boolean = false,
-    var pageTableEntry: PageTableEntry? = null,
+/**
+ * Executes a suite of algorithms against a pre-generated trace while sharing the same physical memory configuration.
+ */
+class PageReplacementExperiment(
+    private val config: SimulationConfig,
 ) {
+    fun run(trace: WorkloadTrace): Map<AlgorithmType, SimulationSummary> {
+        return AlgorithmType.entries.associateWith { algorithm ->
+            val kernel = PagingKernel(config, policyFactory(algorithm))
+            kernel.run(trace, algorithm)
+        }
+    }
+
+    private fun policyFactory(algorithm: AlgorithmType): ReplacementPolicyFactory = when (algorithm) {
+        AlgorithmType.RANDOM -> { frames -> RandomReplacementPolicy(frames) }
+        AlgorithmType.CLOCK -> { frames -> ClockReplacementPolicy(frames) }
+    }
+}
+
+/**
+ * Executes a single algorithm against a trace while tracking detailed statistics.
+ */
+class PagingKernel(
+    private val config: SimulationConfig,
+    private val policyFactory: ReplacementPolicyFactory,
+) {
+    fun run(trace: WorkloadTrace, algorithm: AlgorithmType): SimulationSummary {
+        val memory = MemoryState(config.physicalPageCount)
+        val policy = policyFactory(memory.frames)
+        val processes = mutableMapOf<Int, ProcessContext>()
+        val counters = Counters(config.physicalPageCount)
+        val pageFaultSamples = mutableListOf<PageFaultRecord>()
+
+        trace.events.forEach { event ->
+            when (event) {
+                is TraceEvent.ProcessStart -> {
+                    processes[event.pid] = ProcessContext(event.pid, event.virtualPageCount)
+                }
+
+                is TraceEvent.ProcessTerminate -> {
+                    processes.remove(event.pid)?.let { context ->
+                        memory.releaseProcess(context, policy, counters)
+                    }
+                }
+
+                is TraceEvent.WorkingSetChange -> {
+                    counters.workingSetChanges++
+                }
+
+                is TraceEvent.MemoryAccess -> {
+                    val process = processes[event.pid] ?: return@forEach
+                    handleAccess(
+                        process = process,
+                        event = event,
+                        memory = memory,
+                        policy = policy,
+                        counters = counters,
+                        samples = pageFaultSamples,
+                    )
+                }
+            }
+        }
+
+        val totalAccesses = counters.totalAccesses
+        val pageFaultRate = if (totalAccesses == 0) 0.0 else counters.pageFaults.toDouble() / totalAccesses
+        val perProcessStats = processes.values.map { it.stats } + counters.completedProcessStats.values
+
+        return SimulationSummary(
+            algorithm = algorithm,
+            physicalPages = memory.frames.size,
+            totalAccesses = totalAccesses,
+            pageFaults = counters.pageFaults,
+            pageFaultRate = pageFaultRate,
+            freeFrameFaults = counters.freeFrameFaults,
+            replacements = counters.replacements,
+            diskWrites = counters.diskWrites,
+            cleanEvictions = counters.cleanEvictions,
+            dirtyEvictions = counters.dirtyEvictions,
+            workingSetChanges = counters.workingSetChanges,
+            perProcess = perProcessStats.sortedBy { it.pid },
+            samplePageFaults = pageFaultSamples,
+        )
+    }
+
+    private fun handleAccess(
+        process: ProcessContext,
+        event: TraceEvent.MemoryAccess,
+        memory: MemoryState,
+        policy: PageReplacementPolicy,
+        counters: Counters,
+        samples: MutableList<PageFaultRecord>,
+    ) {
+        val entry = process.pageTable[event.pageIndex]
+        process.stats.accesses++
+        counters.totalAccesses++
+        if (event.isWrite) {
+            process.stats.writeCount++
+        }
+
+        if (entry.present) {
+            entry.frame?.let { frame ->
+                frame.noteAccess(event.isWrite)
+                policy.onFrameAccess(frame)
+            }
+            return
+        }
+
+        process.stats.pageFaults++
+        counters.pageFaults++
+
+        val (frame, victim) = memory.allocate()?.let { freeFrame ->
+            counters.freeFrameFaults++
+            freeFrame to null
+        } ?: run {
+            val victimFrame = policy.chooseVictim()
+            val victimInfo = memory.evictFrame(victimFrame, policy, counters)
+            counters.replacements++
+            victimFrame to victimInfo
+        }
+
+        if (samples.size < MAX_PAGE_FAULT_SAMPLES) {
+            samples += PageFaultRecord(
+                step = event.step,
+                pid = process.pid,
+                pageIndex = event.pageIndex,
+                victim = victim,
+            )
+        }
+
+        memory.loadPage(process, event, frame, policy)
+    }
+}
+
+typealias ReplacementPolicyFactory = (MutableList<PhysicalFrame>) -> PageReplacementPolicy
+
+private class ProcessContext(
+    val pid: Int,
+    virtualPages: Int,
+) {
+    val pageTable: MutableList<PageTableEntry> = MutableList(virtualPages) { PageTableEntry() }
+    val stats: ProcessStats = ProcessStats(pid = pid)
+}
+
+private class MemoryState(frameCount: Int) {
+    val frames: MutableList<PhysicalFrame> = MutableList(frameCount) { PhysicalFrame(it) }
+    private val freeFrames: ArrayDeque<PhysicalFrame> = ArrayDeque(frames)
+
+    fun allocate(): PhysicalFrame? = if (freeFrames.isEmpty()) null else freeFrames.removeFirst()
+
+    fun releaseProcess(
+        process: ProcessContext,
+        policy: PageReplacementPolicy,
+        counters: Counters,
+    ) {
+        process.pageTable.forEach { entry ->
+            if (!entry.present) return@forEach
+            val frame = entry.frame ?: return@forEach
+            if (frame.dirty) {
+                counters.diskWrites++
+                process.stats.dirtyEvictions++
+                counters.dirtyEvictions++
+            } else {
+                counters.cleanEvictions++
+            }
+            policy.onFrameFreed(frame)
+            frame.markFree()
+            entry.clearMapping()
+            freeFrames.addLast(frame)
+        }
+        counters.completedProcessStats[process.pid] = process.stats.copy()
+    }
+
+    fun evictFrame(
+        frame: PhysicalFrame,
+        policy: PageReplacementPolicy,
+        counters: Counters,
+    ): VictimInfo? {
+        val victimPid = frame.ownerPid
+        val victimPage = frame.virtualPage
+        val dirty = frame.dirty
+
+        if (dirty) {
+            counters.diskWrites++
+            counters.dirtyEvictions++
+        } else {
+            counters.cleanEvictions++
+        }
+
+        frame.pageTableEntry?.let { entry ->
+            if (dirty) {
+                entry.ownerStats?.let { stats -> stats.dirtyEvictions++ }
+            }
+            entry.clearMapping()
+        }
+
+        frame.markFree()
+        policy.onFrameFreed(frame)
+
+        return if (victimPid != null && victimPage != null) {
+            VictimInfo(pid = victimPid, pageIndex = victimPage, wasDirty = dirty)
+        } else {
+            null
+        }
+    }
+
+    fun loadPage(
+        process: ProcessContext,
+        event: TraceEvent.MemoryAccess,
+        frame: PhysicalFrame,
+        policy: PageReplacementPolicy,
+    ) {
+        val entry = process.pageTable[event.pageIndex]
+        frame.attach(
+            pid = process.pid,
+            pageIndex = event.pageIndex,
+            entry = entry,
+            isWrite = event.isWrite,
+        )
+        entry.attach(frame, process.stats, event.isWrite)
+        policy.onFrameLoaded(frame)
+    }
+}
+
+private class Counters(
+    val physicalFrames: Int,
+) {
+    var totalAccesses: Int = 0
+    var pageFaults: Int = 0
+    var freeFrameFaults: Int = 0
+    var replacements: Int = 0
+    var diskWrites: Int = 0
+    var cleanEvictions: Int = 0
+    var dirtyEvictions: Int = 0
+    var workingSetChanges: Int = 0
+    val completedProcessStats: MutableMap<Int, ProcessStats> = mutableMapOf()
+}
+
+/**
+ * Mutable descriptor of a single page table entry.
+ */
+class PageTableEntry {
+    var present: Boolean = false
+    var reference: Boolean = false
+    var dirty: Boolean = false
+    var frame: PhysicalFrame? = null
+    var ownerStats: ProcessStats? = null
+
+    fun attach(frame: PhysicalFrame, stats: ProcessStats, isWrite: Boolean) {
+        present = true
+        reference = true
+        dirty = isWrite
+        this.frame = frame
+        ownerStats = stats
+    }
+
+    fun clearMapping() {
+        present = false
+        reference = false
+        dirty = false
+        frame = null
+        ownerStats = null
+    }
+}
+
+/**
+ * Mutable descriptor of a physical frame that keeps track of ownership and attributes.
+ */
+class PhysicalFrame(
+    val index: Int,
+) {
+    var ownerPid: Int? = null
+        private set
+    var virtualPage: Int? = null
+        private set
+    var reference: Boolean = false
+        private set
+    var dirty: Boolean = false
+        private set
+    var pageTableEntry: PageTableEntry? = null
+        private set
+
     fun isFree(): Boolean = ownerPid == null
 
-    fun clear() {
+    fun attach(pid: Int, pageIndex: Int, entry: PageTableEntry, isWrite: Boolean) {
+        ownerPid = pid
+        virtualPage = pageIndex
+        reference = true
+        dirty = isWrite
+        pageTableEntry = entry
+    }
+
+    fun noteAccess(isWrite: Boolean) {
+        reference = true
+        if (isWrite) {
+            dirty = true
+        }
+        pageTableEntry?.let { entry ->
+            entry.reference = true
+            if (isWrite) {
+                entry.dirty = true
+            }
+        }
+    }
+
+    fun clearReference() {
+        reference = false
+        pageTableEntry?.reference = false
+    }
+
+    fun markFree() {
         ownerPid = null
         virtualPage = null
         reference = false
@@ -106,221 +420,9 @@ data class PhysicalFrame(
     }
 }
 
-private class ProcessRuntime(
-    val pid: Int,
-    val virtualPages: Int,
-) {
-    val pageTable: MutableList<PageTableEntry> = MutableList(virtualPages) { PageTableEntry() }
-    val stats = ProcessStats(pid = pid)
-}
-
-class Kernel(
-    private val config: SimulationConfig,
-    private val policyFactory: (List<PhysicalFrame>) -> PageReplacementPolicy,
-) {
-    fun run(trace: WorkloadTrace, algorithm: AlgorithmType): SimulationSummary {
-        val frames = MutableList(config.physicalPageCount) { PhysicalFrame(it) }
-        val policy = policyFactory(frames)
-        val runtimeByPid = mutableMapOf<Int, ProcessRuntime>()
-        val freeFrames = ArrayDeque(frames)
-        val stats = OverallStats(frames.size)
-        val pageFaultSamples = mutableListOf<PageFaultRecord>()
-
-        trace.events.sortedBy { it.step }.forEach { event ->
-            when (event) {
-                is TraceEvent.ProcessStart -> {
-                    runtimeByPid[event.pid] = ProcessRuntime(event.pid, event.virtualPageCount)
-                }
-
-                is TraceEvent.ProcessTerminate -> {
-                    runtimeByPid[event.pid]?.let { proc ->
-                        releaseProcessFrames(proc, freeFrames, policy, stats)
-                    }
-                    runtimeByPid.remove(event.pid)
-                }
-
-                is TraceEvent.WorkingSetChange -> {
-                    stats.workingSetChanges++
-                }
-
-                is TraceEvent.MemoryAccess -> {
-                    val proc = runtimeByPid[event.pid]
-                    if (proc != null) {
-                        handleAccess(
-                            process = proc,
-                            event = event,
-                            policy = policy,
-                            frames = frames,
-                            freeFrames = freeFrames,
-                            stats = stats,
-                            step = event.step,
-                            samples = pageFaultSamples,
-                        )
-                    }
-                }
-            }
-        }
-
-        val totalAccesses = stats.totalAccesses
-        val pageFaultRate = if (totalAccesses == 0) 0.0 else stats.pageFaults.toDouble() / totalAccesses
-        val perProcess = runtimeByPid.values.map { it.stats } + stats.completedProcessStats.values
-        return SimulationSummary(
-            algorithm = algorithm,
-            physicalPages = frames.size,
-            totalAccesses = totalAccesses,
-            pageFaults = stats.pageFaults,
-            pageFaultRate = pageFaultRate,
-            freeFrameFaults = stats.freeFrameFaults,
-            replacements = stats.replacements,
-            diskWrites = stats.diskWrites,
-            cleanEvictions = stats.cleanEvictions,
-            dirtyEvictions = stats.dirtyEvictions,
-            workingSetChanges = stats.workingSetChanges,
-            perProcess = perProcess.sortedBy { it.pid },
-            samplePageFaults = pageFaultSamples,
-        )
-    }
-
-    private fun handleAccess(
-        process: ProcessRuntime,
-        event: TraceEvent.MemoryAccess,
-        policy: PageReplacementPolicy,
-        frames: MutableList<PhysicalFrame>,
-        freeFrames: ArrayDeque<PhysicalFrame>,
-        stats: OverallStats,
-        step: Int,
-        samples: MutableList<PageFaultRecord>,
-    ) {
-        val pte = process.pageTable[event.pageIndex]
-        process.stats.accesses++
-        stats.totalAccesses++
-        if (event.isWrite) {
-            process.stats.writeCount++
-        }
-
-        if (pte.present) {
-            val frame = pte.frame ?: error("Present PTE without frame")
-            frame.reference = true
-            frame.dirty = frame.dirty || event.isWrite
-            frame.pageTableEntry?.reference = true
-            frame.pageTableEntry?.dirty = frame.dirty
-            policy.onFrameAccess(frame)
-            return
-        }
-
-        // Page fault handling.
-        process.stats.pageFaults++
-        stats.pageFaults++
-        val (frame, victimInfo) = if (freeFrames.isNotEmpty()) {
-            stats.freeFrameFaults++
-            freeFrames.removeFirst() to null
-        } else {
-            val victim = policy.chooseVictim()
-            val info = evictFrame(victim, policy, stats)
-            stats.replacements++
-            victim to info
-        }
-
-        if (samples.size < 25) {
-            samples += PageFaultRecord(
-                step = step,
-                pid = process.pid,
-                pageIndex = event.pageIndex,
-                victim = victimInfo,
-            )
-        }
-
-        loadPage(process, event, frame, policy)
-    }
-
-    private fun loadPage(
-        process: ProcessRuntime,
-        event: TraceEvent.MemoryAccess,
-        frame: PhysicalFrame,
-        policy: PageReplacementPolicy,
-    ) {
-        val pte = process.pageTable[event.pageIndex]
-        frame.ownerPid = process.pid
-        frame.virtualPage = event.pageIndex
-        frame.reference = true
-        frame.dirty = event.isWrite
-        frame.pageTableEntry = pte
-
-        pte.present = true
-        pte.reference = true
-        pte.dirty = event.isWrite
-        pte.frame = frame
-        pte.ownerStats = process.stats
-
-        policy.onFrameLoaded(frame)
-    }
-
-    private fun releaseProcessFrames(
-        process: ProcessRuntime,
-        freeFrames: ArrayDeque<PhysicalFrame>,
-        policy: PageReplacementPolicy,
-        stats: OverallStats,
-    ) {
-        process.pageTable.forEach { pte ->
-            if (pte.present) {
-                val frame = pte.frame ?: return@forEach
-                if (frame.dirty) {
-                    stats.diskWrites++
-                    process.stats.dirtyEvictions++
-                    stats.dirtyEvictions++
-                } else {
-                    stats.cleanEvictions++
-                }
-                policy.onFrameFreed(frame)
-                frame.clear()
-                pte.present = false
-                pte.reference = false
-                pte.dirty = false
-                pte.frame = null
-                pte.ownerStats = null
-                freeFrames.add(frame)
-            }
-        }
-        stats.completedProcessStats[process.pid] = process.stats.copy()
-    }
-
-    private fun evictFrame(
-        frame: PhysicalFrame,
-        policy: PageReplacementPolicy,
-        stats: OverallStats,
-    ): VictimInfo? {
-        val victimPid = frame.ownerPid
-        val victimPage = frame.virtualPage
-        val dirty = frame.dirty
-
-        if (dirty) {
-            stats.diskWrites++
-            stats.dirtyEvictions++
-        } else {
-            stats.cleanEvictions++
-        }
-
-        frame.pageTableEntry?.let { entry ->
-            if (dirty) {
-                entry.ownerStats?.let { stats -> stats.dirtyEvictions++ }
-            }
-            entry.present = false
-            entry.reference = false
-            entry.dirty = false
-            entry.frame = null
-            entry.ownerStats = null
-        }
-        val info = if (victimPid != null && victimPage != null) {
-            VictimInfo(pid = victimPid, pageIndex = victimPage, wasDirty = dirty)
-        } else {
-            null
-        }
-        frame.clear()
-        policy.onFrameFreed(frame)
-        return info
-    }
-}
-
+/**
+ * Strategy interface for page replacement algorithms.
+ */
 interface PageReplacementPolicy {
     fun onFrameAccess(frame: PhysicalFrame) = Unit
     fun onFrameLoaded(frame: PhysicalFrame) = Unit
@@ -328,54 +430,48 @@ interface PageReplacementPolicy {
     fun chooseVictim(): PhysicalFrame
 }
 
-class RandomReplacementPolicy(private val frames: List<PhysicalFrame>) : PageReplacementPolicy {
+/**
+ * Random replacement policy used as the baseline algorithm.
+ */
+class RandomReplacementPolicy(
+    private val frames: List<PhysicalFrame>,
+) : PageReplacementPolicy {
     private val rng = java.util.Random(0L)
 
     override fun chooseVictim(): PhysicalFrame {
         val occupied = frames.filter { !it.isFree() }
-        require(occupied.isNotEmpty()) { "No occupied frames to evict" }
+        require(occupied.isNotEmpty()) { "No occupied frames available for eviction." }
         return occupied[rng.nextInt(occupied.size)]
     }
 }
 
-class ClockReplacementPolicy(private val frames: List<PhysicalFrame>) : PageReplacementPolicy {
+/**
+ * Clock replacement policy (second-chance) implementation.
+ */
+class ClockReplacementPolicy(
+    private val frames: List<PhysicalFrame>,
+) : PageReplacementPolicy {
     private var hand: Int = 0
 
     override fun chooseVictim(): PhysicalFrame {
         val total = frames.size
         var iterations = 0
-        while (iterations < total * 2) { // safety bound
+        while (iterations < total * 2) {
             val frame = frames[hand]
             hand = (hand + 1) % total
+            iterations++
 
             if (frame.isFree()) {
-                iterations++
                 continue
             }
 
-            val referenced = frame.reference
-            if (referenced) {
-                frame.reference = false
-                frame.pageTableEntry?.reference = false
-                iterations++
-            } else {
-                return frame
+            if (frame.reference) {
+                frame.clearReference()
+                continue
             }
+
+            return frame
         }
-        // Fallback: choose the first occupied frame if all were referenced.
         return frames.first { !it.isFree() }
     }
 }
-
-private data class OverallStats(
-    val physicalFrames: Int,
-    var totalAccesses: Int = 0,
-    var pageFaults: Int = 0,
-    var freeFrameFaults: Int = 0,
-    var replacements: Int = 0,
-    var diskWrites: Int = 0,
-    var cleanEvictions: Int = 0,
-    var dirtyEvictions: Int = 0,
-    var workingSetChanges: Int = 0,
-    val completedProcessStats: MutableMap<Int, ProcessStats> = mutableMapOf(),
-)

@@ -21,26 +21,27 @@ data class WorkloadConfig(
 )
 
 /**
- * Base class for all events emitted by the workload generator. Events are strictly ordered by the
- * step number.
+ * Base class for all events emitted by the workload generator. Events are strictly ordered by the step number.
  */
-sealed class TraceEvent(open val step: Int) {
+sealed interface TraceEvent {
+    val step: Int
+
     data class ProcessStart(
         override val step: Int,
         val pid: Int,
         val virtualPageCount: Int,
-    ) : TraceEvent(step)
+    ) : TraceEvent
 
     data class ProcessTerminate(
         override val step: Int,
         val pid: Int,
-    ) : TraceEvent(step)
+    ) : TraceEvent
 
     data class WorkingSetChange(
         override val step: Int,
         val pid: Int,
         val newWorkingSet: Set<Int>,
-    ) : TraceEvent(step)
+    ) : TraceEvent
 
     data class MemoryAccess(
         override val step: Int,
@@ -48,9 +49,12 @@ sealed class TraceEvent(open val step: Int) {
         val pageIndex: Int,
         val isWrite: Boolean,
         val currentWorkingSet: Set<Int>,
-    ) : TraceEvent(step)
+    ) : TraceEvent
 }
 
+/**
+ * Collection of workload events alongside the configuration that produced them.
+ */
 data class WorkloadTrace(
     val events: List<TraceEvent>,
     val config: WorkloadConfig,
@@ -59,8 +63,8 @@ data class WorkloadTrace(
 private data class ProcessState(
     val pid: Int,
     val virtualPages: Int,
-    var startStep: Int,
-    var endStep: Int,
+    val startStep: Int,
+    val endStep: Int,
     var currentWorkingSet: MutableSet<Int>,
     var accessesSinceWsChange: Int = 0,
     var started: Boolean = false,
@@ -68,9 +72,7 @@ private data class ProcessState(
 )
 
 /**
- * Generates a deterministic workload trace (given a seed) that follows the specification of the
- * laboratory work. Each process exhibits locality of references: a configurable percentage of
- * accesses go to the current working set, the rest are spread across the remaining pages.
+ * Generates traces that exhibit locality of reference and working set evolution.
  */
 class WorkloadGenerator(private val config: WorkloadConfig) {
     private val rng = Random(config.randomSeed)
@@ -86,40 +88,21 @@ class WorkloadGenerator(private val config: WorkloadConfig) {
         require(config.minLifetimeFraction <= config.maxLifetimeFraction) {
             "minLifetimeFraction cannot exceed maxLifetimeFraction"
         }
+
         val events = mutableListOf<TraceEvent>()
-        val processStates = createProcessStates()
+        val processes = createProcessStates()
         val active = mutableListOf<ProcessState>()
         var rrIndex = 0
         var step = 0
         var generatedAccesses = 0
 
         while (generatedAccesses < config.totalCpuAccesses) {
-            // Activate processes whose start time has come.
-            processStates
-                .filter { !it.started && it.startStep <= step }
-                .forEach {
-                    it.started = true
-                    active += it
-                    events += TraceEvent.ProcessStart(step = step, pid = it.pid, virtualPageCount = it.virtualPages)
-                    events += TraceEvent.WorkingSetChange(
-                        step = step,
-                        pid = it.pid,
-                        newWorkingSet = it.currentWorkingSet.toSet(),
-                    )
-                }
-
-            // Terminate processes whose time has elapsed.
-            val terminating = active.filter { !it.terminated && it.endStep <= step }
-            terminating.forEach {
-                it.terminated = true
-                active.remove(it)
-                events += TraceEvent.ProcessTerminate(step = step, pid = it.pid)
-            }
+            activateReadyProcesses(processes, active, step, events)
+            terminateElapsedProcesses(active, step, events)
 
             if (active.isEmpty()) {
-                // Fast forward to the next interesting point.
-                val nextStart = processStates
-                    .filter { it.startStep > step }
+                val nextStart = processes
+                    .filter { !it.started }
                     .minOfOrNull { it.startStep }
                     ?: break
                 step = nextStart
@@ -129,17 +112,7 @@ class WorkloadGenerator(private val config: WorkloadConfig) {
             val process = active[rrIndex % active.size]
             rrIndex++
 
-            // Update working set if needed.
-            process.accessesSinceWsChange++
-            if (process.accessesSinceWsChange >= config.workingSetChangeInterval) {
-                process.currentWorkingSet = pickWorkingSet(process.virtualPages)
-                process.accessesSinceWsChange = 0
-                events += TraceEvent.WorkingSetChange(
-                    step = step,
-                    pid = process.pid,
-                    newWorkingSet = process.currentWorkingSet.toSet(),
-                )
-            }
+            maybeRotateWorkingSet(process, step, events)
 
             val access = generateAccess(process, step)
             events += access
@@ -147,50 +120,80 @@ class WorkloadGenerator(private val config: WorkloadConfig) {
             step++
         }
 
-        // Ensure all active processes terminate for completeness.
-        processStates
-            .filter { it.started && !it.terminated }
-            .forEach { state ->
-                events += TraceEvent.ProcessTerminate(step = max(step, state.endStep), pid = state.pid)
-                state.terminated = true
-            }
+        forceTerminateRemaining(processes, step, events)
 
-        val ordered = events.sortedWith(compareBy<TraceEvent> { it.step }.thenBy { eventOrder(it) })
+        val ordered = events.sortedWith(compareBy<TraceEvent> { it.step }.thenBy(::eventOrder))
         return WorkloadTrace(events = ordered, config = config)
     }
 
-    private fun createProcessStates(): List<ProcessState> {
-        val result = mutableListOf<ProcessState>()
-        var nextStartCandidate = 0
-        repeat(config.processCount) { idx ->
-            val pid = idx
-            val lifetimeFraction = rng.nextDouble(
-                config.minLifetimeFraction,
-                config.maxLifetimeFraction,
-            )
-            val accessesForProcess = max(1, (config.totalCpuAccesses * lifetimeFraction / config.processCount).toInt())
-            val duration = max(accessesForProcess, config.workingSetChangeInterval * 2)
-            val startUpper = max(nextStartCandidate + 1, config.totalCpuAccesses / 2)
-            val start = if (idx == 0) 0 else rng.nextInt(nextStartCandidate, startUpper)
-            val end = start + duration
-            nextStartCandidate = min(config.totalCpuAccesses - 1, start + config.workingSetChangeInterval)
-            val workingSet = pickWorkingSet(config.virtualPagesPerProcess)
+    private fun activateReadyProcesses(
+        processes: List<ProcessState>,
+        active: MutableList<ProcessState>,
+        step: Int,
+        sink: MutableList<TraceEvent>,
+    ) {
+        processes
+            .filter { !it.started && it.startStep <= step }
+            .forEach { process ->
+                process.started = true
+                active += process
+                sink += TraceEvent.ProcessStart(step = step, pid = process.pid, virtualPageCount = process.virtualPages)
+                sink += TraceEvent.WorkingSetChange(
+                    step = step,
+                    pid = process.pid,
+                    newWorkingSet = process.currentWorkingSet.toSet(),
+                )
+            }
+    }
 
-            result += ProcessState(
-                pid = pid,
-                virtualPages = config.virtualPagesPerProcess,
-                startStep = start,
-                endStep = end,
-                currentWorkingSet = workingSet,
+    private fun terminateElapsedProcesses(
+        active: MutableList<ProcessState>,
+        step: Int,
+        sink: MutableList<TraceEvent>,
+    ) {
+        val terminating = active.filter { !it.terminated && it.endStep <= step }
+        terminating.forEach { process ->
+            process.terminated = true
+            active.remove(process)
+            sink += TraceEvent.ProcessTerminate(step = step, pid = process.pid)
+        }
+    }
+
+    private fun maybeRotateWorkingSet(
+        process: ProcessState,
+        step: Int,
+        sink: MutableList<TraceEvent>,
+    ) {
+        process.accessesSinceWsChange++
+        if (process.accessesSinceWsChange >= config.workingSetChangeInterval) {
+            process.currentWorkingSet = pickWorkingSet(process.virtualPages)
+            process.accessesSinceWsChange = 0
+            sink += TraceEvent.WorkingSetChange(
+                step = step,
+                pid = process.pid,
+                newWorkingSet = process.currentWorkingSet.toSet(),
             )
         }
-        return result.sortedBy { it.startStep }
+    }
+
+    private fun forceTerminateRemaining(
+        processes: List<ProcessState>,
+        currentStep: Int,
+        sink: MutableList<TraceEvent>,
+    ) {
+        processes
+            .filter { it.started && !it.terminated }
+            .forEach { process ->
+                val terminationStep = max(currentStep, process.endStep)
+                process.terminated = true
+                sink += TraceEvent.ProcessTerminate(step = terminationStep, pid = process.pid)
+            }
     }
 
     private fun generateAccess(process: ProcessState, step: Int): TraceEvent.MemoryAccess {
         val isLocal = rng.nextDouble() < config.localityProbability
         val isWrite = rng.nextDouble() < config.writeProbability
-        val page = if (isLocal && process.currentWorkingSet.isNotEmpty()) {
+        val targetPage = if (isLocal && process.currentWorkingSet.isNotEmpty()) {
             process.currentWorkingSet.random(rng)
         } else {
             pickOutsidePage(process)
@@ -199,7 +202,7 @@ class WorkloadGenerator(private val config: WorkloadConfig) {
         return TraceEvent.MemoryAccess(
             step = step,
             pid = process.pid,
-            pageIndex = page,
+            pageIndex = targetPage,
             isWrite = isWrite,
             currentWorkingSet = process.currentWorkingSet.toSet(),
         )
@@ -223,6 +226,32 @@ class WorkloadGenerator(private val config: WorkloadConfig) {
             result += rng.nextInt(virtualPages)
         }
         return result
+    }
+
+    private fun createProcessStates(): List<ProcessState> {
+        val states = mutableListOf<ProcessState>()
+        var nextStartCandidate = 0
+        repeat(config.processCount) { index ->
+            val pid = index
+            val lifetimeFraction = rng.nextDouble(config.minLifetimeFraction, config.maxLifetimeFraction)
+            val accessesForProcess = max(1, (config.totalCpuAccesses * lifetimeFraction / config.processCount).toInt())
+            val duration = max(accessesForProcess, config.workingSetChangeInterval * 2)
+            val startUpper = max(nextStartCandidate + 1, config.totalCpuAccesses / 2)
+            val start = if (index == 0) 0 else rng.nextInt(nextStartCandidate, startUpper)
+            val end = start + duration
+            nextStartCandidate = min(config.totalCpuAccesses - 1, start + config.workingSetChangeInterval)
+            val workingSet = pickWorkingSet(config.virtualPagesPerProcess)
+
+            states += ProcessState(
+                pid = pid,
+                virtualPages = config.virtualPagesPerProcess,
+                startStep = start,
+                endStep = end,
+                currentWorkingSet = workingSet,
+            )
+        }
+
+        return states.sortedBy { it.startStep }
     }
 
     private fun eventOrder(event: TraceEvent): Int = when (event) {
