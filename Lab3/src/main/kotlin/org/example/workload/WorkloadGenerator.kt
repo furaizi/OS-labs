@@ -5,73 +5,6 @@ import kotlin.math.min
 import kotlin.random.Random
 
 /**
- * Configuration parameters that control the shape of the generated workload.
- */
-data class WorkloadConfig(
-    val processCount: Int,
-    val virtualPagesPerProcess: Int,
-    val workingSetSize: Int,
-    val workingSetChangeInterval: Int,
-    val totalCpuAccesses: Int,
-    val localityProbability: Double = 0.9,
-    val writeProbability: Double = 0.3,
-    val minLifetimeFraction: Double = 0.5,
-    val maxLifetimeFraction: Double = 0.9,
-    val randomSeed: Long = 42L,
-)
-
-/**
- * Base class for all events emitted by the workload generator. Events are strictly ordered by the step number.
- */
-sealed interface TraceEvent {
-    val step: Int
-
-    data class ProcessStart(
-        override val step: Int,
-        val pid: Int,
-        val virtualPageCount: Int,
-    ) : TraceEvent
-
-    data class ProcessTerminate(
-        override val step: Int,
-        val pid: Int,
-    ) : TraceEvent
-
-    data class WorkingSetChange(
-        override val step: Int,
-        val pid: Int,
-        val newWorkingSet: Set<Int>,
-    ) : TraceEvent
-
-    data class MemoryAccess(
-        override val step: Int,
-        val pid: Int,
-        val pageIndex: Int,
-        val isWrite: Boolean,
-        val currentWorkingSet: Set<Int>,
-    ) : TraceEvent
-}
-
-/**
- * Collection of workload events alongside the configuration that produced them.
- */
-data class WorkloadTrace(
-    val events: List<TraceEvent>,
-    val config: WorkloadConfig,
-)
-
-private data class ProcessState(
-    val pid: Int,
-    val virtualPages: Int,
-    val startStep: Int,
-    val endStep: Int,
-    var currentWorkingSet: MutableSet<Int>,
-    var accessesSinceWsChange: Int = 0,
-    var started: Boolean = false,
-    var terminated: Boolean = false,
-)
-
-/**
  * Generates traces that exhibit locality of reference and working set evolution.
  */
 class WorkloadGenerator(private val config: WorkloadConfig) {
@@ -261,3 +194,15 @@ class WorkloadGenerator(private val config: WorkloadConfig) {
         is TraceEvent.ProcessTerminate -> 3
     }
 }
+
+/** Internal per-process generator state. */
+private data class ProcessState(
+    val pid: Int,
+    val virtualPages: Int,
+    val startStep: Int,
+    val endStep: Int,
+    var currentWorkingSet: MutableSet<Int>,
+    var accessesSinceWsChange: Int = 0,
+    var started: Boolean = false,
+    var terminated: Boolean = false,
+)
