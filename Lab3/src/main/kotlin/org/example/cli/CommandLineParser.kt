@@ -54,17 +54,17 @@ class CommandLineParser {
     """.trimIndent()
 
     private fun validate(o: CliOptions) {
-        require(o.physicalFrames > 0) { "physical-frames must be positive" }
-        require(o.processCount > 0) { "processes must be positive" }
-        require(o.virtualPagesPerProcess > 0) { "virtual-pages must be positive" }
-        require(o.workingSetSizes.isNotEmpty()) { "working-set-sizes must contain at least one positive value" }
-        require(o.workingSetSizes.none { it > o.virtualPagesPerProcess }) {
-            "working-set size cannot exceed the virtual page count"
+        if (o.physicalFrames <= 0) throw CliParsingException("physical-frames must be positive")
+        if (o.processCount <= 0) throw CliParsingException("processes must be positive")
+        if (o.virtualPagesPerProcess <= 0) throw CliParsingException("virtual-pages must be positive")
+        if (o.workingSetSizes.isEmpty()) throw CliParsingException("working-set-sizes must contain at least one positive value")
+        if (o.workingSetSizes.any { it > o.virtualPagesPerProcess }) {
+            throw CliParsingException("working-set size cannot exceed the virtual page count")
         }
-        require(o.workingSetChangeInterval > 0) { "working-set-change must be positive" }
-        require(o.totalCpuAccesses > 0) { "total-accesses must be positive" }
-        require(o.localityProbability in 0.0..1.0) { "locality must be within [0, 1]" }
-        require(o.writeProbability in 0.0..1.0) { "write-prob must be within [0, 1]" }
+        if (o.workingSetChangeInterval <= 0) throw CliParsingException("working-set-change must be positive")
+        if (o.totalCpuAccesses <= 0) throw CliParsingException("total-accesses must be positive")
+        if (o.localityProbability !in 0.0..1.0) throw CliParsingException("locality must be within [0, 1]")
+        if (o.writeProbability !in 0.0..1.0) throw CliParsingException("write-prob must be within [0, 1]")
     }
 
     private fun splitKeyValue(arg: String): Pair<String, String> {
