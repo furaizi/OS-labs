@@ -7,16 +7,14 @@ fun main() {
     val fs = FileSystem()
     val reader = BufferedReader(InputStreamReader(System.`in`))
 
-    println("In-memory FS lab (one directory). Type 'help' for commands, 'quit' to exit.")
+    println("In-memory FS (directories + symlinks). Type 'help' for commands, 'quit' to exit.")
 
     while (true) {
         print("> ")
         val line = reader.readLine() ?: break
         val trimmed = line.trim()
-        if (trimmed.isEmpty())
-            continue
-        if (trimmed == "quit" || trimmed == "exit")
-            break
+        if (trimmed.isEmpty()) continue
+        if (trimmed == "quit" || trimmed == "exit") break
 
         val parts = trimmed.split("\\s+".toRegex())
         val cmd = parts[0]
@@ -25,14 +23,15 @@ fun main() {
             when (cmd) {
                 "help" -> printHelp()
 
-                // mkfs n – для ФС у пам'яті параметр n ігноруємо
+                // mkfs [n] – n ігноруємо (in-memory варіант)
                 "mkfs" -> {
                     fs.mkfs()
                     println("File system re-initialized (in-memory)")
                 }
 
                 "ls" -> {
-                    val entries = fs.ls()
+                    val path = parts.getOrNull(1)
+                    val entries = fs.ls(path)
                     if (entries.isEmpty()) {
                         println("(empty)")
                     } else {
@@ -43,24 +42,28 @@ fun main() {
                 }
 
                 "create" -> {
-                    val name = parts.getOrNull(1) ?: error("Usage: create name")
-                    fs.create(name)
-                    println("Created file '$name'")
+                    val path = parts.getOrNull(1) ?: error("Usage: create pathname")
+                    fs.create(path)
+                    println("Created file '$path'")
                 }
 
                 "stat" -> {
-                    val name = parts.getOrNull(1) ?: error("Usage: stat name")
-                    val st = fs.stat(name)
+                    val path = parts.getOrNull(1) ?: error("Usage: stat pathname")
+                    val st = fs.stat(path)
+                    val extra = if (st.symlinkTarget != null) {
+                        " target='${st.symlinkTarget}'"
+                    } else {
+                        ""
+                    }
                     println(
-                        "name=$name id=${st.id} type=${st.type} " +
-                                "size=${st.size} links=${st.linkCount} " +
-                                "open=${st.openCount} blocks=${st.blockCount}"
+                        "path=$path id=${st.id} type=${st.type} size=${st.size} " +
+                                "links=${st.linkCount} open=${st.openCount} blocks=${st.blockCount}$extra"
                     )
                 }
 
                 "open" -> {
-                    val name = parts.getOrNull(1) ?: error("Usage: open name")
-                    val fd = fs.open(name)
+                    val path = parts.getOrNull(1) ?: error("Usage: open pathname")
+                    val fd = fs.open(path)
                     println("fd=$fd")
                 }
 
@@ -90,31 +93,55 @@ fun main() {
                     val size = parts.getOrNull(2)?.toIntOrNull() ?: error("Usage: write fd size")
                     require(size >= 0) { "size must be non-negative" }
 
-                    // Для простоти пишемо size байт 'x'.
-                    // Якщо треба – легко замінити на читання реальних даних зі stdin.
+                    // як і раніше – записуємо size байт 'x'
                     val data = ByteArray(size) { 'x'.code.toByte() }
                     val written = fs.write(fd, data)
                     println("Written $written bytes")
                 }
 
                 "link" -> {
-                    val name1 = parts.getOrNull(1) ?: error("Usage: link name1 name2")
-                    val name2 = parts.getOrNull(2) ?: error("Usage: link name1 name2")
-                    fs.link(name1, name2)
-                    println("Linked '$name2' -> '$name1'")
+                    val oldPath = parts.getOrNull(1) ?: error("Usage: link oldPath newPath")
+                    val newPath = parts.getOrNull(2) ?: error("Usage: link oldPath newPath")
+                    fs.link(oldPath, newPath)
+                    println("Linked '$newPath' -> '$oldPath'")
                 }
 
                 "unlink" -> {
-                    val name = parts.getOrNull(1) ?: error("Usage: unlink name")
-                    fs.unlink(name)
-                    println("Unlinked '$name'")
+                    val path = parts.getOrNull(1) ?: error("Usage: unlink pathname")
+                    fs.unlink(path)
+                    println("Unlinked '$path'")
                 }
 
                 "truncate" -> {
-                    val name = parts.getOrNull(1) ?: error("Usage: truncate name size")
-                    val size = parts.getOrNull(2)?.toLongOrNull() ?: error("Usage: truncate name size")
-                    fs.truncate(name, size)
-                    println("Truncated '$name' to $size bytes")
+                    val path = parts.getOrNull(1) ?: error("Usage: truncate pathname size")
+                    val size = parts.getOrNull(2)?.toLongOrNull() ?: error("Usage: truncate pathname size")
+                    fs.truncate(path, size)
+                    println("Truncated '$path' to $size bytes")
+                }
+
+                "mkdir" -> {
+                    val path = parts.getOrNull(1) ?: error("Usage: mkdir pathname")
+                    fs.mkdir(path)
+                    println("Directory '$path' created")
+                }
+
+                "rmdir" -> {
+                    val path = parts.getOrNull(1) ?: error("Usage: rmdir pathname")
+                    fs.rmdir(path)
+                    println("Directory '$path' removed")
+                }
+
+                "cd" -> {
+                    val path = parts.getOrNull(1) ?: error("Usage: cd pathname")
+                    fs.cd(path)
+                    println("Current directory changed to '$path'")
+                }
+
+                "symlink" -> {
+                    val target = parts.getOrNull(1) ?: error("Usage: symlink target pathname")
+                    val linkPath = parts.getOrNull(2) ?: error("Usage: symlink target pathname")
+                    fs.symlink(target, linkPath)
+                    println("Symlink '$linkPath' -> '$target' created")
                 }
 
                 else -> println("Unknown command '$cmd'. Type 'help' for list.")
@@ -130,17 +157,21 @@ private fun printHelp() {
         """
         Commands:
           mkfs                      - reinitialize file system (in-memory)
-          ls                        - list hard links (name, type, inode id)
-          create name               - create regular file
-          stat name                 - print file metadata
-          open name                 - open file, print fd
+          ls [path]                 - list directory contents (current dir or given path)
+          create pathname           - create regular file
+          stat pathname             - show inode metadata (does NOT follow final symlink)
+          open pathname             - open regular file (follows symlinks), print fd
           close fd                  - close open file descriptor
           seek fd offset            - set offset for fd
           read fd size              - read size bytes and print them as UTF-8 string
           write fd size             - write 'size' bytes of 'x' into file
-          link name1 name2          - create hard link name2 -> name1
-          unlink name               - remove hard link
-          truncate name size        - change file size (growth uses sparse zero blocks)
+          link oldPath newPath      - create hard link newPath -> oldPath (no hard links to dirs)
+          unlink pathname           - remove hard link (not for directories)
+          truncate pathname size    - change size of regular file (sparse growth)
+          mkdir pathname            - create directory
+          rmdir pathname            - remove empty directory (only '.' and '..' allowed inside)
+          cd pathname               - change current working directory
+          symlink target pathname   - create symbolic link 'pathname' with content 'target'
           help                      - show this help
           quit / exit               - exit program
         """.trimIndent()
