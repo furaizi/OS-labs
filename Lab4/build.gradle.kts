@@ -11,7 +11,7 @@ repositories {
 }
 
 application {
-    mainClass.set("fs.lab4.MainKt")
+    mainClass.set("org.example.MainKt")
 }
 
 dependencies {
